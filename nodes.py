@@ -123,6 +123,11 @@ class HuggingFaceModelCardReaderNode:
                     "max": 100000,
                     "step": 1,
                     "tooltip": "Current line number (auto increments after each run)"
+                }),
+                "repo_id": ("STRING", {
+                    "multiline": False,
+                    "default": "repoid",
+                    "tooltip": "Enter repo id or file path"
                 })
             }
         }
@@ -139,18 +144,21 @@ class HuggingFaceModelCardReaderNode:
         clean = re.sub(r"\s+", " ", clean).strip()  # collapse whitespace
         return clean
         
-    def fetch_model_card(self, file_path: str, line_no: int):
+    def fetch_model_card(self, file_path: str, line_no: int, repo_id: str ):
         """Fetch model card info for the repo ID at the given line."""
-        if not os.path.exists(file_path):
-            raise FileNotFoundError(f"❌ File not found: {file_path}")
-
-        with open(file_path, "r", encoding="utf-8") as f:
-            lines = [line.strip() for line in f if line.strip()]
-
-        if line_no < 1 or line_no > len(lines):
-            raise ValueError(f"❌ Line number {line_no} is out of range (file has {len(lines)} lines).")
-
-        repo_id = lines[line_no - 1]
+        #if not os.path.exists(file_path):
+            #raise FileNotFoundError(f"❌ File not found: {file_path}")
+        lines = []
+        if os.path.exists(file_path):
+            with open(file_path, "r", encoding="utf-8") as f:
+                lines = [line.strip() for line in f if line.strip()]
+    
+            if line_no < 1 or line_no > len(lines):
+                raise ValueError(f"❌ Line number {line_no} is out of range (file has {len(lines)} lines).")
+    
+            repo_id = lines[line_no - 1]
+        else:
+            repo_id = repo_id
         print(f"📦 Fetching model card for: {repo_id}")
 
         try:
@@ -163,8 +171,10 @@ class HuggingFaceModelCardReaderNode:
         last_modified = str(info.lastModified)
         tags = ", ".join(info.tags) if info.tags else "None"
         model_card_text = self.clean_html(card.text)  # limit for display, optional
-
-        next_line = line_no + 1 if line_no < len(lines) else 1  # wrap around to start
+        if lines:
+            next_line = line_no + 1 if line_no < len(lines) else 1  # wrap around to start
+        else:
+            next_line=1
         print(f"✅ Fetched successfully. Next line: {next_line}")
 
         return (model_name, last_modified, tags, model_card_text, next_line)

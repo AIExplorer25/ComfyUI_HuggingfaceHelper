@@ -5,6 +5,10 @@ import os
 import re
 from huggingface_hub import ModelCard, model_info
 import json
+import os
+import json
+import torch
+from transformers import pipeline
 class HuggingFacePromptBuilder:
     """
     🧠 Custom node to combine Hugging Face model card info and a user instruction.
@@ -218,6 +222,355 @@ class QwenResponseExtract:
 
         return (cleaned_text,)
 
+class PTagExtractor:
+    """
+    🧩 Extracts all text inside <p>...</p> tags and returns them as a list of strings.
+    """
+
+    @classmethod
+    def INPUT_TYPES(cls):
+        return {
+            "required": {
+                "html_text": ("STRING", {
+                    "multiline": True,
+                    "default": "",
+                    "tooltip": "Input text containing multiple <p>...</p> tags"
+                }),
+            },
+        }
+
+    RETURN_TYPES = ("STRING_LIST",)
+    RETURN_NAMES = ("p_tag_list",)
+    FUNCTION = "extract"
+    CATEGORY = "🧩 Qwen Utils"
+
+    def extract(self, html_text: str):
+        """
+        Extracts all <p>...</p> content using regex.
+        Returns list of strings.
+        """
+
+        # Finds ALL <p>...</p> content, including multiline
+        matches = re.findall(r"<p>(.*?)</p>", html_text, re.DOTALL | re.IGNORECASE)
+
+        # Clean whitespace
+        cleaned = [m.strip() for m in matches if m.strip()]
+
+        # Return as STRING_LIST type
+        return (cleaned,)
+
+
+
+
+class GoogleSearchFromList:
+    """
+    🔍 Takes a STRING_LIST of search terms and performs Google Custom Search for each.
+    Returns a combined list of result URLs.
+    """
+
+    @classmethod
+    def INPUT_TYPES(cls):
+        return {
+            "required": {
+                "query_list": ("STRING_LIST", {
+                    "default": [],
+                    "tooltip": "List of search phrases (from PTagExtractor)"
+                }),
+                "API_KEY": ("STRING", {
+                    "default": "",
+                    "tooltip": "Google API Key"
+                }),
+                "CSE_ID": ("STRING", {
+                    "default": "",
+                    "tooltip": "Google Custom Search Engine ID"
+                }),
+                "results_per_query": ("INT", {
+                    "default": 5,
+                    "min": 1,
+                    "max": 10,
+                    "tooltip": "Number of Google results per query"
+                }),
+            }
+        }
+
+    RETURN_TYPES = ("STRING_LIST",)
+    RETURN_NAMES = ("all_result_links",)
+    FUNCTION = "run_search"
+    CATEGORY = "🧩 Web Utils"
+
+    def google_search(self, query, api_key, cse_id, num_results):
+        """Internal helper: executes Google Search API call."""
+        url = "https://www.googleapis.com/customsearch/v1"
+        params = {
+            "key": api_key,
+            "cx": cse_id,
+            "q": query,
+            "num": num_results
+        }
+
+        response = requests.get(url, params=params)
+        response.raise_for_status()
+        data = response.json()
+
+        # Extract result links
+        results = []
+        if "items" in data:
+            for item in data["items"]:
+                if "link" in item:
+                    results.append(item["link"])
+
+        return results
+
+    def run_search(self, query_list, API_KEY, CSE_ID, results_per_query):
+        """
+        For each query in query_list:
+        - Search Google
+        - Append URLs to allresultslinks[]
+        """
+
+        allresultslinks = []
+
+        for query in query_list:
+            query = query.strip()
+            if not query:
+                continue
+
+            try:
+                google_results = self.google_search(query, API_KEY, CSE_ID, results_per_query)
+                for url in google_results:
+                    allresultslinks.append(url)
+            except Exception as e:
+                # Store error but keep pipeline running
+                allresultslinks.append(f"ERROR: {query} --> {str(e)}")
+        allresultslinks = list(dict.fromkeys(allresultslinks))    
+
+        return (allresultslinks,)
+
+
+
+
+class PageData:
+    """Simple container for scraped result."""
+    def __init__(self, link, content):
+        self.link = link
+        self.content = content
+
+    def __repr__(self):
+        return f"PageData(link={self.link}, content_length={len(self.content)})"
+
+
+class JinaPageScraper:
+    """
+    🌐 Takes a list of URLs and fetches page content using Jina Reader API.
+    Saves each result as numbered TXT file.
+    Returns a list of PageData objects (link + page_content).
+    """
+
+    @classmethod
+    def INPUT_TYPES(cls):
+        return {
+            "required": {
+                "url_list": ("STRING_LIST", {
+                    "default": [],
+                    "tooltip": "List of URLs to scrape using Jina Reader API"
+                }),
+                "JINA_API_KEY": ("STRING", {
+                    "default": "",
+                    "tooltip": "Jina Reader API Key (optional)"
+                }),
+                "scrape_first_n_links": ("INT", {
+                    "default": 5,
+                    "min": 1,
+                    "max": 10,
+                    "tooltip": "Number of Google results per query"
+                }),
+            }
+        }
+
+    RETURN_TYPES = ("OBJECT_LIST",)
+    RETURN_NAMES = ("scraped_pages",)
+    FUNCTION = "scrape"
+    CATEGORY = "🧩 Web Utils"
+
+    def fetch_with_jina(self, url: str, api_key: str):
+        """
+        Calls Jina Reader API:
+        https://r.jina.ai/<url>
+        Returns extracted clean content.
+        """
+
+        api_url = "https://r.jina.ai/" + url
+
+        headers = {
+            "x-respond-with": "markdown"
+        }
+
+        if api_key and len(api_key.strip()) > 0:
+            headers["Authorization"] = f"Bearer {api_key}"
+
+        resp = requests.get(api_url, headers=headers)
+        resp.raise_for_status()
+
+        return resp.text
+
+    def scrape(self, url_list, JINA_API_KEY, scrape_first_n_links):
+        """
+        Loops through URLs -> fetches content -> saves TXT file -> returns list of PageData objects.
+        """
+        if scrape_first_n_links:
+            url_list = url_list[:scrape_first_n_links]
+        results = []
+        counter = 1  # Start numbering files 1.txt, 2.txt ...
+        # ---------------------------
+        # Ensure ledger.txt exists
+        # ---------------------------
+        data_folder = os.path.join(os.path.dirname(os.path.abspath(__file__)), "data")
+        os.makedirs(data_folder, exist_ok=True)
+        ledger_path = os.path.join(data_folder, "ledger.txt")
+        counter_path = os.path.join(data_folder, "counter.txt")
+    
+        if not os.path.exists(ledger_path):
+            with open(ledger_path, "w") as f:
+                pass  # create empty file
+        if not os.path.exists(counter_path):
+            with open(counter_path, "w") as f:
+                pass  # create empty file
+            with open(counter_path, "w", encoding="utf-8") as f:
+                        f.write("1")
+        with open(ledger_path, "r") as f:
+            content = f.read().strip()   # read, remove spaces/newlines
+        try:
+            value = int(content)+1         # convert to int
+            counter=value
+        except ValueError:
+            value = 1  # or raise error — depends on what you want
+
+        # Load existing links into a set
+        with open(ledger_path, "r") as f:
+            ledger_links = set(line.strip() for line in f if line.strip())
+    
+        # ---------------------------
+        # Begin scraping loop
+        # ---------------------------
+        for link in url_list:
+            link = link.strip()
+            
+            if not link:
+                continue
+            # ---------------------------
+            # Skip if already processed
+            # ---------------------------
+            if link in ledger_links:
+                print(f"[SKIP] Already in ledger: {link}")
+                continue
+            try:
+                content = self.fetch_with_jina(link, JINA_API_KEY)
+
+                # -------------------------
+                # SAVE CONTENT AS TXT FILE
+                # -------------------------
+                filename = f"{counter}.txt"
+                file_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), filename)
+                with open(file_path, "w", encoding="utf-8") as f:
+                    f.write(f"LINK: {link}\n")
+                    f.write("######\n")
+                    f.write(content)
+                with open(ledger_path, "a") as f:
+                    f.write(link + "###" + filename)
+                with open(counter_path, "w", encoding="utf-8") as f:
+                        f.write(counter)
+                counter += 1
+
+                # Now add the object
+                results.append(PageData(link, content))
+
+            except Exception as e:
+                error_text = f"ERROR: {str(e)}"
+
+                # Save error file too
+                filename = f"{counter}.txt"
+                with open(filename, "w", encoding="utf-8") as f:
+                    f.write(f"LINK: {link}\n")
+                    f.write("######\n")
+                    f.write(error_text)
+
+                counter += 1
+
+                results.append(PageData(link, error_text))
+
+        return (results,)
+
+
+
+class GPTOSSHelper:
+    @classmethod
+    def INPUT_TYPES(cls):
+        return {
+            "required": {
+                "system_message": ("STRING", {"multiline": True, "default": ""}),
+                "your_prompt": ("STRING", {"multiline": True, "default": ""}),
+                "model_path": ("STRING", {"multiline": True, "default": ""}),  # unused but kept for compatibility
+                "model_name": ("STRING", {"multiline": True, "default": "openai/gpt-oss-20b"}),
+                "n_gpu_layers": ("INT", {"default": 0, "min": 0, "max": 1}),  # unused but required for compatibility
+                "n_ctx": ("INT", {"default": 8192, "min": 24, "max": 20000}),
+                "max_tokens": ("INT", {"default": 512, "min": 24, "max": 20000}),
+            }
+        }
+
+    RETURN_TYPES = ("STRING",)
+    RETURN_NAMES = ("gptoss_response",)
+    FUNCTION = "generate_response_gptoss"
+    OUTPUT_NODE = True
+    CATEGORY = "utils"
+
+    def generate_response_gptoss(
+        self,
+        system_message,
+        your_prompt,
+        model_path,
+        model_name,
+        n_gpu_layers,
+        n_ctx,
+        max_tokens,
+    ):
+
+        # Final model ID (can be HF hub ID)
+        model_id = model_name.strip() or "openai/gpt-oss-20b"
+
+        print(f"Loading GPT-OSS model: {model_id}")
+
+        pipe = pipeline(
+            "text-generation",
+            model=model_id,
+            torch_dtype="auto",
+            device_map="auto",
+        )
+
+        # Build GPT-OSS chat structure
+        messages = []
+        if system_message.strip():
+            messages.append({"role": "system", "content": system_message})
+
+        messages.append({"role": "user", "content": your_prompt})
+
+        # Run inference
+        outputs = pipe(
+            messages,
+            max_new_tokens=max_tokens,
+        )
+
+        # Extract the final assistant message
+        generated = outputs[0]["generated_text"][-1]
+
+        # Save raw result to a JSON file (same behaviour as your Qwen node)
+        caption_file_path = os.path.join(model_path, "gptoss_response.json")
+        try:
+            with open(caption_file_path, "w", encoding="utf-8") as f:
+                json.dump(outputs, f, indent=2)
+        except:
+            print("[WARN] Cannot save output JSON. Check write permissions.")
+
+        return (generated,)
 
 # Register node
 
@@ -225,14 +578,26 @@ NODE_CLASS_MAPPINGS = {
     "HuggingFaceModelCardReader": HuggingFaceModelCardReaderNode,
     "HuggingFaceTrendingModels": HuggingFaceTrendingModelsNode,
     "HuggingFacePromptBuilder": HuggingFacePromptBuilder,
-    "QwenResponseExtract": QwenResponseExtract
+    "QwenResponseExtract": QwenResponseExtract,
+    "PTagExtractor": PTagExtractor,
+    "GoogleSearchFromList": GoogleSearchFromList,
+    "JinaPageScraper": JinaPageScraper,
+    "GPTOSSHelper": GPTOSSHelper,
+    
+    
+    
 }
 
 NODE_DISPLAY_NAME_MAPPINGS = {
     "HuggingFaceModelCardReader": "🤗 HuggingFace Model Card Reader",
     "HuggingFaceTrendingModels": "🤗 Fetch HuggingFace Trending Models",
     "HuggingFacePromptBuilder": "🤗 HuggingFace Prompt Builder",
-    "QwenResponseExtract": "🧩 Qwen Response Extract"
+    "QwenResponseExtract": "🧩 Qwen Response Extract",
+    "PTagExtractor": "🧩 P Tag Extractor",
+    "GoogleSearchFromList": "🧩 Google Search From List",
+    "JinaPageScraper": "🧩 Jina Page Scraper",
+    "GPTOSSHelper": "GPT OSS Helper"
+    
 }
 
 
